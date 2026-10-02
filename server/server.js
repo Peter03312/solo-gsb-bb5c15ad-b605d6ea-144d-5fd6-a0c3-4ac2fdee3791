@@ -10,6 +10,7 @@ const labels = require('./labels');
 const shipments = require('./shipments');
 const evaluation = require('./evaluation');
 const lots = require('./lots');
+const backfill = require('./backfill');
 const { traceMaterial } = require('./trace');
 
 const PORT = parseInt(process.env.PORT || '3000', 10);
@@ -81,7 +82,7 @@ app.get('/api/state', (req, res) => {
 
   const events = db.prepare(
     `SELECT ev.id, ev.event_time, ev.type, ev.equipment_id, ev.note,
-            ev.clean_allergens,
+            ev.clean_allergens, ev.ext_record_no, ev.backfill_no,
             ev.batch_id, b.code AS batch_code,
             bo.allergens AS out_allergens,
             bo.paths_json AS out_paths
@@ -97,6 +98,10 @@ app.get('/api/state', (req, res) => {
     note: ev.note,
     batch_id: ev.batch_id,
     batch_code: ev.batch_code,
+    // 断网整包补录留痕（单条事件接口写入的事件均为 null/''）。
+    ext_record_no: ev.ext_record_no || null,
+    backfill_no: ev.backfill_no || '',
+    backfilled: !!ev.ext_record_no,
     clean_allergens: ev.clean_allergens ? JSON.parse(ev.clean_allergens) : null,
     clean_scope_full: ev.clean_allergens == null,
     ...(ev.type === 'CLEAN' ? {
@@ -609,6 +614,49 @@ function normalizeEventBody(body, isUpdate = false) {
 
 function idList(v) {
   return [...new Set((Array.isArray(v) ? v : []).map((x) => parseInt(x, 10)).filter(Number.isInteger))];
+}
+
+// ---------- 断网整包补录（加工 / 已核实清洗日志） ----------
+// POST /api/backfills：整包提交补录批号 + 有序记录；幂等/冲突/整包回滚规则见 server/backfill.js。
+app.post('/api/backfills', (req, res) => {
+  try {
+    res.json(backfill.submitBackfill(db, req.body || {}));
+  } catch (err) { sendBackfillError(res, err); }
+});
+
+// 对账：补录批号列表
+app.get('/api/backfills', (req, res) => {
+  try {
+    res.json(backfill.listBackfills(db));
+  } catch (err) { sendBackfillError(res, err); }
+});
+
+// 对账：按补录批号查询外部记录号 -> 事件号映射、逐条状态与影响快照
+app.get('/api/backfills/:backfillNo', (req, res) => {
+  try {
+    res.json(backfill.getBackfill(db, decodeURIComponent(req.params.backfillNo)));
+  } catch (err) { sendBackfillError(res, err); }
+});
+
+function sendBackfillError(res, err) {
+  if (err && err.name === 'BackfillError') {
+    if (err.code === 'BACKFILL_NOT_FOUND') {
+      return res.status(404).json({ error: err.message, code: err.code, details: err.details });
+    }
+    // 批号/外部记录号冲突（同号不同内容）= 冲突类语义，整包拒绝且不留任何事件。
+    const conflict = err.code === 'BACKFILL_NO_CONFLICT' || err.code === 'EXT_RECORD_CONFLICT';
+    return res.status(conflict ? 409 : 400).json({
+      error: err.message,
+      code: err.code,
+      details: err.details
+    });
+  }
+  if (err && err.name === 'LotError') {
+    // 供应批号不存在 / 与原料不匹配：沿用批号档案的既有错误形状（400 + code/details）。
+    return res.status(400).json({ error: err.message, code: err.code, details: err.details });
+  }
+  console.error(err);
+  return res.status(500).json({ error: err && err.message ? err.message : '服务器内部错误' });
 }
 
 // ---------- 放行 ----------

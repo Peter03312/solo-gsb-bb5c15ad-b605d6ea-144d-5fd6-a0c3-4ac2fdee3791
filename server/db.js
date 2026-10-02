@@ -65,6 +65,11 @@ function initSchema(d) {
     --   显式空数组（'[]'）非法，写入时拒绝；PROCESS 事件恒为 NULL。
     clean_allergens TEXT,
     note TEXT NOT NULL DEFAULT '',
+    -- 断网补录留痕：由整包补录写入的事件携带外部记录号与补录批号（单条事件接口恒为 NULL）。
+    -- ext_record_no 全局唯一（NULL 可重复）：外部记录号与已入库内容冲突由写入侧比对并整包拒绝，
+    -- 唯一索引为最终防线；同号同内容复用时不写入新事件，直接复用原事件。
+    ext_record_no TEXT,
+    backfill_no TEXT NOT NULL DEFAULT '',
     created_at TEXT NOT NULL DEFAULT (datetime('now'))
   );
 
@@ -206,7 +211,42 @@ function initSchema(d) {
     version INTEGER NOT NULL DEFAULT 0
   );
 
+  -- 断网补录：整包补录批号（幂等键）。同号重试返回原结果；同号内容不同整包拒绝。
+  CREATE TABLE IF NOT EXISTS backfill_batches (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    backfill_no TEXT NOT NULL UNIQUE,        -- 补录批号（客户端幂等键，如 BF-20261001-01）
+    note TEXT NOT NULL DEFAULT '',
+    status TEXT NOT NULL DEFAULT 'APPLIED'
+      CHECK (status IN ('APPLIED')),         -- 目前只有整包成功落库一种状态（失败整包回滚不留痕）
+    record_count INTEGER NOT NULL DEFAULT 0,-- 包内有序记录条数
+    inserted_count INTEGER NOT NULL DEFAULT 0, -- 本次实际新写入事件数
+    reused_count INTEGER NOT NULL DEFAULT 0,   -- 命中既有外部记录号、复用原事件的条数
+    content_hash TEXT NOT NULL DEFAULT '',   -- 整包规范化内容哈希（同号不同内容据此拒绝）
+    impact_json TEXT NOT NULL DEFAULT '{}',  -- 补录成功时的影响摘要（放行/卷/出货/处置）
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    applied_at TEXT NOT NULL DEFAULT (datetime('now'))
+  );
+
+  -- 断网补录：包内有序记录与“外部记录号 -> 事件号”映射。
+  -- 同号同内容的既有记录不重复写入：复用其它补录包已产生的事件（status='REUSED'）。
+  -- event_id 不加外键/ON DELETE：事件可经既有 DELETE /api/events/:id 删除（其错误约定不变），
+  -- 删除后对账映射原样保留，明细以 event_exists=false 标明（只增不改的审计保留语义）。
+  CREATE TABLE IF NOT EXISTS backfill_records (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    backfill_id INTEGER NOT NULL REFERENCES backfill_batches(id),
+    seq INTEGER NOT NULL,                    -- 包内序号（从 0 开始，有序记录的提交次序）
+    ext_record_no TEXT NOT NULL,             -- 外部记录号（客户端系统的记录标识）
+    event_id INTEGER NOT NULL,               -- 映射到的事件号（不加外键：事件可经单条接口删除，对账映射保留，event_exists=false 标明）
+    content_hash TEXT NOT NULL DEFAULT '',   -- 该条规范化内容哈希（外部记录号冲突据此比对）
+    status TEXT NOT NULL CHECK (status IN ('INSERTED','REUSED')), -- 新写入 / 复用既有事件
+    backfilled_at TEXT NOT NULL DEFAULT '',  -- 事件来源补录批号（INSERTED=本包；REUSED=原包）
+    UNIQUE (backfill_id, seq)
+  );
+
   CREATE INDEX IF NOT EXISTS idx_events_time ON events(event_time, id);
+  CREATE INDEX IF NOT EXISTS idx_backfill_records_ext ON backfill_records(ext_record_no);
+  CREATE INDEX IF NOT EXISTS idx_backfill_records_event ON backfill_records(event_id);
+  CREATE INDEX IF NOT EXISTS idx_backfill_created ON backfill_batches(created_at);
   CREATE INDEX IF NOT EXISTS idx_process_inputs_event ON process_inputs(event_id);
   CREATE INDEX IF NOT EXISTS idx_material_lots_material ON material_lots(material_id);
   CREATE INDEX IF NOT EXISTS idx_releases_batch ON releases(batch_id);
@@ -235,6 +275,15 @@ function initSchema(d) {
   if (!eventCols.includes('clean_allergens')) {
     d.exec('ALTER TABLE events ADD COLUMN clean_allergens TEXT');
   }
+  // events.ext_record_no/backfill_no：断网整包补录留痕（旧事件与单条接口写入均为 NULL/''）。
+  if (!eventCols.includes('ext_record_no')) {
+    d.exec('ALTER TABLE events ADD COLUMN ext_record_no TEXT');
+  }
+  if (!eventCols.includes('backfill_no')) {
+    d.exec("ALTER TABLE events ADD COLUMN backfill_no TEXT NOT NULL DEFAULT ''");
+  }
+  // 外部记录号全局唯一（SQLite 唯一索引允许多个 NULL，单条接口写入的事件不受影响）。
+  d.exec('CREATE UNIQUE INDEX IF NOT EXISTS idx_events_ext_record ON events(ext_record_no)');
 }
 
 module.exports = { getDb, initDbFile, initSchema, DB_PATH };

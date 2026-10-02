@@ -671,7 +671,7 @@ function openShadow(sourceDb) {
   copy('material_lots', 'id,material_id,lot_code,supplier,note,status,flagged_reason,created_at');
   copy('equipment', 'id,code,name');
   copy('batches', 'id,code');
-  copy('events', 'id,event_time,type,equipment_id,batch_id,clean_allergens,note');
+  copy('events', 'id,event_time,type,equipment_id,batch_id,clean_allergens,note,ext_record_no,backfill_no');
   copy('process_inputs', 'id,event_id,material_id,batch_id,material_lot_id');
   copy('batch_outputs', 'batch_id,allergens,paths_json');
   copy('equipment_residue', 'equipment_id,allergens,paths_json,last_cleaned_at');

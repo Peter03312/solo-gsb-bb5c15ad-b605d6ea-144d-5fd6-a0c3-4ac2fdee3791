@@ -12,6 +12,10 @@
 逐时传播，**全清截断全部设备残留；部分清洗按来源原料的过敏原逐项截断**（尚有未清除过敏原
 或原料无过敏原登记时不能排除批号，只有全清截断）；结果分**确定命中**与**因批号未知无法排除**
 两类并给出传播依据与关联出货单，事件更正/删除后按最新合法时间线更新。**追溯仅供查询，不自动改变放行、卷、出货与处置结论。**
+设备**断网期间的加工与已核实清洗日志**可在恢复后凭**补录批号整包补录**：有序记录（每条含外部记录号、时间、设备）
+一次事务写入，包内引用只可指向更早产出；同号同内容重试返回原结果、同号内容不同或外部记录号冲突整包拒绝，
+未知对象/空清洗集合/时间冲突/未来或循环引用均整包回滚；成功后按现有时间线规则重算设备残留、放行、标签卷、
+出货与处置影响，并可按补录批号查询“外部记录号→事件号”对账结果。
 
 - 后端：Node.js + Express
 - 数据库：SQLite（[better-sqlite3](https://github.com/WiseLibs/better-sqlite3)，数据文件本地保存）
@@ -709,6 +713,151 @@ curl -s 'http://localhost:3000/api/trace/material-lot?material_id=3&lot_id=2&pat
 
 > 追溯是**只读**查询：重复调用不会停用标签卷、不会把出货单转待评估、不会失效放行或改动处置结论。
 
+## 断网日志整包补录（设备断网期间的加工与已核实清洗，本轮新增）
+
+设备断网期间的**加工**与**已核实清洗**日志可在恢复后**整包补录**：一次提交一个**补录批号**与一组**有序记录**，
+整包通过校验才落库，任一记录不合法则**整包回滚、不留任何部分事件**；成功后按现有时间线规则
+**全量重算设备残留、批次放行、标签卷、出货单与处置影响**。
+
+### 记录与引用规则
+
+- 每条记录必须含 **外部记录号 `ext_record_no`**（客户端系统中的记录标识，全局唯一）、**时间 `event_time`**
+  （`YYYY-MM-DDTHH:MM`，不允许未来时间）与**设备**（`equipment_id` 或 `equipment_code`）。
+- **加工记录 `type:"PROCESS"`**：含产出批次 `batch_code`；可含原料输入 `material_inputs`
+  （每项 `{material_id|material_code, lot_id?|lot_code?}`，**省略供应批号即“批号未知”**，同原料可多行多批号），
+  和/或批次引用：
+  - `ref_batch_codes`：按**批次编码**引用既有批次或本包更早产出；
+  - `ref_record_nos`：按**外部记录号**引用更早的加工产出——本包内记录必须位于更前的序号且时间严格更早；
+    也可指向**此前已补录入库**的外部记录号（其产出时间必须严格更早）。
+  - **包内引用只可指向更早产出**；引用未来批次、同时刻批次、引用成环一律整包拒绝。
+- **清洗记录 `type:"CLEAN"`**：省略 `clean_allergens`（或 `null`）= **全清**；
+  传非空过敏原数组 = **部分清洗**；显式空集 `[]`、非字符串/空白名称拒绝（与单条清洗接口同一约定）。
+- 同一设备同一时刻不允许两条事件（包内、与既有事件之间均校验，冲突整包拒绝）。
+- 未知设备 / 原料 / 供应批号 / 引用批次均整包拒绝；原料编码、设备编码与 id 二选一即可。
+
+### 幂等与冲突（整包语义）
+
+| 情形 | 行为 |
+| --- | --- |
+| **补录批号相同 + 内容完全相同**重试 | 返回首次结果（`idempotent_replay:true`、原外部记录号→事件号映射与影响快照），**不重复写入任何事件/批次，不再次产生影响** |
+| **补录批号相同、内容不同** | `409 BACKFILL_NO_CONFLICT`，整包拒绝 |
+| 外部记录号已入库且**内容相同** | 复用原事件（该条 `status:"REUSED"`，不重复写入），包内其余新记录正常写入 |
+| 外部记录号已入库但**内容冲突** | `409 EXT_RECORD_CONFLICT`，整包拒绝 |
+| 同号同内容的既有记录 | 绝不重复写入（数据库对外部记录号有唯一约束兜底） |
+
+> “内容相同”按规范化后的内容比对（去空格、清洗过敏原去重排序、原料输入行顺序不敏感、引用顺序不敏感）；
+> 但**记录的有序次序属于包内容**：记录先后不同即视为不同的包（包内引用顺序随之变化）。
+
+### HTTP API
+
+| 方法与路径 | 说明 |
+| --- | --- |
+| `POST /api/backfills` | 整包补录。请求体 `{backfill_no, note?, records:[...]}`；成功返回逐条映射与影响摘要 |
+| `GET /api/backfills` | 对账：全部成功补录批号列表（被整包拒绝的包不留痕，不在列表中） |
+| `GET /api/backfills/:backfill_no` | 对账：外部记录号→事件号映射、逐条 `INSERTED/REUSED` 状态、来源补录批号与影响快照；未知批号 `404 BACKFILL_NOT_FOUND` |
+
+成功响应：
+
+```json
+{ "ok": true, "idempotent_replay": false,
+  "backfill_no": "BF-20261001-01", "record_count": 3, "inserted_count": 3, "reused_count": 0,
+  "event_mapping": { "EXT-0001": 12, "EXT-0002": 13, "EXT-0003": 14 },
+  "events": [ { "seq": 0, "ext_record_no": "EXT-0001", "event_id": 12, "type": "PROCESS",
+                "event_time": "2026-10-01T08:00", "equipment_id": 1,
+                "batch_code": "BK-001", "status": "INSERTED" }, ... ],
+  "invalidated": [ ... ],          // 重算后失效的放行（同单条事件接口形状）
+  "retired_rolls": [ ... ],        // 永久停用的标签卷
+  "pending_shipments": [ ... ],    // 转待评估的出货单（完整单据）
+  "stale_dispositions": [ ... ] } // 需重新评估的处置结论
+```
+
+`GET /api/state` 的事件另附补录留痕字段（**纯附加项**，既有字段不变）：
+`ext_record_no`（单条接口写入的事件为 `null`）、`backfill_no`、`backfilled`。
+
+#### 调用示例（curl）
+
+```bash
+# 1) 整包补录：P1 加工（奶粉批号已知 + 花生批号未知）→ 部分清洗（只去乳）→ P2 加工引用 P1
+curl -s -X POST http://localhost:3000/api/backfills \
+  -H 'Content-Type: application/json' -d '{
+    "backfill_no": "BF-20261001-01",
+    "note": "断网 10/01 上午补录",
+    "records": [
+      { "ext_record_no": "EXT-0001", "type": "PROCESS",
+        "event_time": "2026-10-01T08:00", "equipment_code": "LINE-A",
+        "batch_code": "BK-001", "note": "断网期间加工",
+        "material_inputs": [
+          { "material_code": "MILK-01", "lot_code": "SUP-MILK-20260925-A" },
+          { "material_id": 6 }
+        ] },
+      { "ext_record_no": "EXT-0002", "type": "CLEAN",
+        "event_time": "2026-10-01T09:00", "equipment_id": 1,
+        "note": "已核实局部清洗", "clean_allergens": ["乳"] },
+      { "ext_record_no": "EXT-0003", "type": "PROCESS",
+        "event_time": "2026-10-01T10:00", "equipment_id": 1,
+        "batch_code": "BK-002",
+        "material_inputs": [{ "material_code": "SALT-01" }],
+        "ref_record_nos": ["EXT-0001"] }
+    ]
+  }'
+# -> { ok:true, idempotent_replay:false, record_count:3, inserted_count:3, reused_count:0,
+#      event_mapping:{ "EXT-0001":12, "EXT-0002":13, "EXT-0003":14 },
+#      invalidated:[...], retired_rolls:[...], pending_shipments:[...], stale_dispositions:[...] }
+
+# 2) 网络超时后原样重发同一补录批号 + 同一内容 -> 返回原结果，不重复写入
+#    （idempotent_replay:true，event_mapping 与首次一致）
+
+# 3) 跨包重传：EXT-0001 已入库且内容相同 -> REUSED 复用事件 12；EXT-0004 为新记录
+curl -s -X POST http://localhost:3000/api/backfills \
+  -H 'Content-Type: application/json' -d '{
+    "backfill_no": "BF-20261001-02",
+    "records": [
+      { "ext_record_no": "EXT-0001", "type": "PROCESS",
+        "event_time": "2026-10-01T08:00", "equipment_id": 1, "batch_code": "BK-001",
+        "material_inputs": [
+          { "material_id": 3, "lot_id": 1 }, { "material_id": 6 } ] },
+      { "ext_record_no": "EXT-0004", "type": "PROCESS",
+        "event_time": "2026-10-01T11:00", "equipment_id": 1, "batch_code": "BK-003",
+        "material_inputs": [{ "material_id": 7 }],
+        "ref_batch_codes": ["BK-002"] }
+    ] }'
+# -> { inserted_count:1, reused_count:1,
+#      event_mapping:{ "EXT-0001":12, "EXT-0004":15 }, ... }
+
+# 4) 非法包整包拒绝（无任何事件/批次落库），例如显式空清洗集合：
+curl -s -X POST http://localhost:3000/api/backfills -H 'Content-Type: application/json' -d '{
+  "backfill_no": "BF-BAD",
+  "records": [ { "ext_record_no": "X", "type": "CLEAN",
+                 "event_time": "2026-10-01T07:00", "equipment_id": 1,
+                 "clean_allergens": [] } ] }'
+# -> 400 { error:"records[0]：清洗范围不能为空数组（…）", code:"EMPTY_CLEAN_SCOPE", details:[...] }
+
+# 5) 对账：按补录批号查询映射与逐条状态/影响
+curl -s http://localhost:3000/api/backfills/BF-20261001-01
+# -> { backfill_no, status:"APPLIED", record_count, inserted_count, reused_count,
+#      event_mapping:{...},
+#      records:[{ seq, ext_record_no, event_id, event_exists,
+#                 status:"INSERTED"|"REUSED", origin_backfill_no, type, event_time,
+#                 equipment_id, batch_code? }],
+#      impact:{ invalidated, retired_rolls, pending_shipments, stale_dispositions } }
+curl -s http://localhost:3000/api/backfills          # 补录批号列表
+```
+
+| 场景 | HTTP | `code` |
+| --- | --- | --- |
+| 请求体形状错、缺外部记录号/时间/设备/批次、包内外部记录号重复、非数组字段 | 400 | `INVALID_REQUEST` / `DUPLICATE_EXT_RECORD` |
+| 空补录包、显式空清洗集合、未来时间 | 400 | `EMPTY_PACKAGE` / `EMPTY_CLEAN_SCOPE` / `FUTURE_TIME` |
+| 未知设备 / 原料 / 引用批次 / 引用记录号 | 400 | `UNKNOWN_EQUIPMENT` / `UNKNOWN_MATERIAL` / `UNKNOWN_BATCH` / `INVALID_RECORD_REF` |
+| 供应批号不存在或与原料不匹配 | 400 | `LOT_NOT_FOUND` / `LOT_MATERIAL_MISMATCH`（沿用批号档案错误约定） |
+| 产出批次编码已存在/包内重复、时间冲突（包内/与既有） | 400 | `BATCH_CODE_CONFLICT` / `TIME_CONFLICT` |
+| 时间线兜底校验失败（未来/循环引用等） | 400 | `PACKAGE_REJECTED`（details 为中文原因数组，整包回滚） |
+| 补录批号同号不同内容、外部记录号内容冲突 | **409** | `BACKFILL_NO_CONFLICT` / `EXT_RECORD_CONFLICT` |
+| 对账批号不存在 | 404 | `BACKFILL_NOT_FOUND` |
+
+说明：补录写入的事件可继续通过既有 `GET /api/state`、追溯等只读接口查看；
+**现有单条事件接口（`POST/PUT/DELETE /api/events`）的请求体、响应体与错误约定完全不变**，
+补录仅为其附加字段与新接口，不影响旧客户端。端到端验证：`npm run test:backfill`。
+
 ## 一键启动（Docker，从空环境开始）
 
 要求安装 Docker 与 Docker Compose（v2）。在项目目录执行：
@@ -749,6 +898,7 @@ npm run test:shipments # 端到端验证包装出货：余额、整单事务拒�
 npm run test:evaluations # 端到端验证待评估单质量处置：评估视图/版本并发/CONTINUE 条件/只增不改/需重新评估
 npm run test:trace       # 端到端验证供应批号登记/投料批号/追溯传播（直接/引用/残留/清洗截断/未知无法排除）/更正删除更新/换线带批号/只读不改动
 npm run test:partial-clean # 端到端验证部分清洗：入参校验/只清指定过敏原/重算联动（放行/卷/出货/处置）/追溯按过敏原保留设备传播/全清与无过敏原原料/换线预演确认
+npm run test:backfill     # 端到端验证断网整包补录：映射/幂等重放/同号冲突/外部记录号冲突与复用/整包回滚/影响摘要/对账查询/单条接口兼容
 ```
 
 ## 访问地址与端口
@@ -820,8 +970,9 @@ server/
   lots.js        # 原料供应批号：档案登记/标记/删除、投料批号解析（不存在/不匹配明确拒绝）
   trace.js       # 批号流向追溯：逐时回放（直接投料/前序引用/设备残留；全清截断、部分清洗按来源过敏原逐次截断）、确定命中与批号未知无法排除、关联出货单
   replan.js      # 整组换线：影子库预演、业务版本签名令牌、事务确认应用（update/insert_clean 支持 clean_allergens 清洗范围；update 支持 material_inputs 带批号）
+  backfill.js    # 断网整包补录：有序记录规范化/引用解析/内容哈希、同号幂等与外部记录号冲突复用、整包事务写入+校验+重算留痕、按补录批号对账
   seed.js        # 首次启动演示数据（含供应批号、同原料多批号投料、一卷演示标签卷与一张演示出货单）
-  server.js      # Express API 与静态页面（含 /api/material-lots、/api/trace/material-lot、/api/label-rolls、/api/shipments、/api/replan/preview|apply、/api/shipments/:id/evaluation|dispositions）
+  server.js      # Express API 与静态页面（含 /api/material-lots、/api/trace/material-lot、/api/label-rolls、/api/shipments、/api/replan/preview|apply、/api/backfills、/api/shipments/:id/evaluation|dispositions）
 public/
   index.html  styles.css  app.js
 scripts/
@@ -832,5 +983,6 @@ scripts/
   test-evaluations.js # 出货质量处置：评估视图/版本并发/CONTINUE 条件/只增不改/需重新评估端到端测试
   test-trace.js       # 供应批号与流向追溯：档案/投料批号/三路径传播/清洗截断/未知无法排除/更正删除/换线带批号/只读 端到端测试
   test-partial-clean.js # 部分清洗：入参校验/部分清除推导/重算联动/追溯过敏原级截断/换线预演确认 端到端测试
+  test-backfill.js     # 断网整包补录：映射/幂等重放/冲突复用/各类整包回滚/影响摘要/对账/接口兼容 端到端测试
 Dockerfile  docker-compose.yml
 ```
