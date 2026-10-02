@@ -10,6 +10,7 @@ const labels = require('./labels');
 const shipments = require('./shipments');
 const evaluation = require('./evaluation');
 const lots = require('./lots');
+const backfill = require('./backfill');
 const { traceMaterial } = require('./trace');
 
 const PORT = parseInt(process.env.PORT || '3000', 10);
@@ -64,6 +65,20 @@ app.get('/api/state', (req, res) => {
 
   // 逐时回放一次：得到每次清洗的清洗范围与清洗后残留，以及设备最近一次清洗范围。
   const replay = replayTimeline(db);
+  // 事件 -> 外部记录号（来自断网补录台账；同一事件可能被多个补录包同号复用，取首次）。
+  const backfillRefByEvent = new Map();
+  db.prepare(
+    `SELECT br.event_id, br.external_ref, bb.backfill_code
+       FROM backfill_records br JOIN backfill_batches bb ON bb.id = br.backfill_id
+      WHERE br.event_id IS NOT NULL ORDER BY br.id`
+  ).all().forEach((r) => {
+    if (!backfillRefByEvent.has(r.event_id)) {
+      backfillRefByEvent.set(r.event_id, {
+        external_ref: r.external_ref,
+        backfill_code: r.backfill_code
+      });
+    }
+  });
   const cleanInfoByEvent = new Map();
   for (const rev of replay.events) {
     if (rev.type !== 'CLEAN') continue;
@@ -97,6 +112,8 @@ app.get('/api/state', (req, res) => {
     note: ev.note,
     batch_id: ev.batch_id,
     batch_code: ev.batch_code,
+    // 若事件来自断网补录，附首次补录该事件的外部记录号与补录批号（只读展示）。
+    ...(backfillRefByEvent.get(ev.id) || {}),
     clean_allergens: ev.clean_allergens ? JSON.parse(ev.clean_allergens) : null,
     clean_scope_full: ev.clean_allergens == null,
     ...(ev.type === 'CLEAN' ? {
@@ -514,6 +531,8 @@ app.delete('/api/events/:id', (req, res) => {
         d.prepare('DELETE FROM batch_outputs WHERE batch_id=?').run(existing.batch_id);
         d.prepare('DELETE FROM batches WHERE id=?').run(existing.batch_id);
       }
+      // 断网补录台账只增不改：事件经单条接口删除时解绑其 event_id（对账时显示“已删除”）。
+      d.prepare('UPDATE backfill_records SET event_id = NULL WHERE event_id = ?').run(existing.id);
       d.prepare('DELETE FROM events WHERE id=?').run(existing.id);
       });
     } finally {
@@ -832,6 +851,46 @@ function sendReplanError(res, err) {
     // 预演版本过期/签名失效/内容不一致：冲突类语义，明确拒绝且不改动任何数据。
     const status = err.code === 'VERSION_EXPIRED' || err.code === 'CHANGES_MISMATCH'
       ? 409 : 400;
+    return res.status(status).json({
+      error: err.message,
+      code: err.code,
+      details: err.details
+    });
+  }
+  console.error(err);
+  return res.status(500).json({ error: err && err.message ? err.message : '服务器内部错误' });
+}
+
+// ---------- 断网日志整包补录 / 对账 ----------
+// 整包提交断网期间的加工与已核实清洗记录：整包事务化校验+重算，
+// 返回外部记录号 -> 事件号映射与影响摘要；相同补录批号+内容重试返回原结果。
+app.post('/api/backfills', (req, res) => {
+  try {
+    res.json(backfill.submitBackfill(db, req.body || {}));
+  } catch (err) { sendBackfillError(res, err); }
+});
+
+// 补录批号列表（对账入口）
+app.get('/api/backfills', (req, res) => {
+  try {
+    res.json({ backfills: backfill.listBackfills(db) });
+  } catch (err) { sendBackfillError(res, err); }
+});
+
+// 按补录批号查询对账结果（逐条与当前时间线比对：一致/已更正/已删除）
+app.get('/api/backfills/:code', (req, res) => {
+  try {
+    res.json(backfill.getBackfill(db, decodeURIComponent(String(req.params.code || ''))));
+  } catch (err) { sendBackfillError(res, err); }
+});
+
+function sendBackfillError(res, err) {
+  if (err && err.name === 'BackfillError') {
+    if (err.code === 'BACKFILL_NOT_FOUND') {
+      return res.status(404).json({ error: err.message, code: err.code, details: err.details });
+    }
+    const status = err.code === 'BACKFILL_CODE_CONFLICT' ||
+      err.code === 'BACKFILL_EXTERNAL_REF_CONFLICT' ? 409 : 400;
     return res.status(status).json({
       error: err.message,
       code: err.code,

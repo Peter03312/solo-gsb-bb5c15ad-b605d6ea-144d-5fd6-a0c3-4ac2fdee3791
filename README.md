@@ -709,6 +709,185 @@ curl -s 'http://localhost:3000/api/trace/material-lot?material_id=3&lot_id=2&pat
 
 > 追溯是**只读**查询：重复调用不会停用标签卷、不会把出货单转待评估、不会失效放行或改动处置结论。
 
+## 断网期间日志整包补录与对账
+
+设备断网期间发生的**加工**与**已核实清洗**日志，恢复联网后可用一个**补录批号**整包补录：
+
+- 提交时带**补录批号**（`backfill_code`）与**有序记录数组**（`records`，顺序即断网期间发生顺序）；
+  每条记录必须含**外部记录号**（`external_ref`，断网日志中的原始记录号）、**时间**（`event_time`）与
+  **设备**（`equipment_id` 或 `equipment_code`）。
+- **加工记录**（`type:"PROCESS"`）还含：产出批次 `batch_code`、原料输入 `material_inputs`
+  （每项 `{ material_id|material_code, lot_id?|lot_code? }`，**省略批号即批号未知**；
+  旧式 `material_ids` 也仍可用）和/或引用批次 `ref_batch_codes`（亦兼容旧式 `ref_batch_ids`）。
+- **清洗记录**（`type:"CLEAN"`）：**省略 `clean_allergens` 表示全清**，传**非空名称数组表示部分清洗**
+  （语义、校验与单条 CLEAN 接口完全一致：显式空集、非字符串/空白名称拒绝）。
+- **包内引用只可指向有序记录中更早产出的批次**（记录顺序更早且产出时间严格更早）；
+  引用库内既有批次同样要求其产出时间严格更早。
+- **整包事务化**：未知设备/原料/供应批号/引用批次、空清洗集合、同设备同时间冲突、
+  未来/同时刻引用、循环引用、批次重复产出、外部记录号冲突等——**整包回滚，不留部分事件**。
+- **幂等与冲突**：
+  - **相同补录批号 + 相同内容重试**：返回首次成功的原结果（`idempotent:true`，事件号映射不变，不重复写入）；
+    用 id 或编码引用同一档案视为同内容。
+  - **相同补录批号 + 不同内容**：整包拒绝（`409 BACKFILL_CODE_CONFLICT`）。
+  - **外部记录号与已入库记录同号同内容**：跨包提交时**复用其既有事件，不重复写入**
+    （计入 `reused_events`，新包台账仍记录该外部记录号）；
+    **同号不同内容**整包拒绝（`409 BACKFILL_EXTERNAL_REF_CONFLICT`）。
+- 补录成功后按**现有时间线规则全量重算**：设备残留与批次过敏原、放行失效、标签卷永久停用、
+  出货单转待评估、质量处置结论标需重新评估，与既有单条事件写入的联动完全相同。
+- 响应返回 **外部记录号 → 事件号映射**（`event_mapping`）与**影响摘要**（`impact_summary`，
+  另以既有形状平铺 `invalidated`/`retired_rolls`/`pending_shipments`/`stale_dispositions`）。
+- 可按补录批号**查询对账结果**：逐条与当前时间线比对——`OK`（内容一致）、
+  `MISMATCH`（事件后经单条接口更正，附字段差异）、`DELETED`（事件已被删除，台账记录保留）。
+- 既有单条事件接口（`POST/PUT/DELETE /api/events`）的请求、响应与错误约定**完全保持不变**；
+  补录产生的事件在 `/api/state` 中另附只读的 `external_ref` 与 `backfill_code`。
+
+### HTTP API
+
+| 方法与路径 | 说明 |
+| --- | --- |
+| `POST /api/backfills` | 整包提交补录（整包事务化校验 + 重算）；同号同内容重试幂等返回原结果 |
+| `GET /api/backfills` | 补录批号列表（记录数、新写入/复用数、已删除事件数） |
+| `GET /api/backfills/:code` | 按补录批号查询对账结果（逐条 `OK`/`MISMATCH`/`DELETED` 与首次结果） |
+| `GET /api/state` | 补录产生的事件另附只读 `external_ref`、`backfill_code`（既有字段不变） |
+
+请求体（加工 + 全清/部分清洗混排；`records` 顺序即时间线顺序）：
+
+```json
+{
+  "backfill_code": "BF-LINEA-20261001",
+  "records": [
+    { "external_ref": "DEV-A-20261001-001", "type": "PROCESS",
+      "event_time": "2026-10-01T08:00", "equipment_code": "LINE-A",
+      "batch_code": "BATCH-OFF-001", "note": "断网早班：蛋糕糊",
+      "material_inputs": [
+        { "material_code": "MILK-01", "lot_code": "SUP-MILK-20260925-A" },
+        { "material_id": 4 }
+      ],
+      "ref_batch_codes": [] },
+    { "external_ref": "DEV-A-20261001-002", "type": "CLEAN",
+      "event_time": "2026-10-01T09:00", "equipment_code": "LINE-A",
+      "note": "换线全清（省略 clean_allergens 即全清）" },
+    { "external_ref": "DEV-A-20261001-003", "type": "PROCESS",
+      "event_time": "2026-10-01T10:00", "equipment_id": 1,
+      "batch_code": "BATCH-OFF-002", "note": "部分清洗演示前序批",
+      "material_inputs": [{ "material_code": "PEANUT-01" }] },
+    { "external_ref": "DEV-A-20261001-004", "type": "CLEAN",
+      "event_time": "2026-10-01T10:30", "equipment_id": 1,
+      "clean_allergens": ["花生"], "note": "部分清洗：仅核实去花生" },
+    { "external_ref": "DEV-A-20261001-005", "type": "PROCESS",
+      "event_time": "2026-10-01T11:00", "equipment_id": 1,
+      "batch_code": "BATCH-OFF-003",
+      "material_inputs": [{ "material_code": "EGG-01" }],
+      "ref_batch_codes": ["BATCH-OFF-001"] }
+  ]
+}
+```
+
+成功响应（外部记录号 → 事件号映射 + 影响摘要 + 既有形状的平铺联动结果）：
+
+```json
+{
+  "ok": true,
+  "backfill_code": "BF-LINEA-20261001",
+  "backfill_id": 3,
+  "idempotent": false,
+  "record_count": 5,
+  "events": [{ "external_ref": "DEV-A-20261001-001", "event_id": 10 }],
+  "event_mapping": {
+    "DEV-A-20261001-001": 10, "DEV-A-20261001-002": 11,
+    "DEV-A-20261001-003": 12, "DEV-A-20261001-004": 13,
+    "DEV-A-20261001-005": 14
+  },
+  "produced_batches": [
+    { "external_ref": "DEV-A-20261001-001", "batch_code": "BATCH-OFF-001", "batch_id": 6, "event_id": 10 }
+  ],
+  "impact_summary": {
+    "inserted_events": 5, "reused_events": 0, "produced_batches": 3,
+    "invalidated_releases": 1, "retired_label_rolls": 1,
+    "pending_shipments": 1, "stale_dispositions": 0
+  },
+  "invalidated": [ { "id": 1, "batch_code": "BATCH-003", "reason": "早期事件更正后重算，…" } ],
+  "retired_rolls": [ { "id": 1, "roll_code": "LABEL-0001", "reason": "…", "applied_pending_review": 120 } ],
+  "pending_shipments": [ { "shipment_code": "SHIP-0001", "status": "PENDING_REVIEW", "items": [ /*快照*/ ] } ],
+  "stale_dispositions": []
+}
+```
+
+#### 调用示例（curl）
+
+```bash
+# 1) 整包补录断网期间的两条加工与一次全清（含批号未知输入与包内引用）
+curl -s -X POST http://localhost:3000/api/backfills \
+  -H 'Content-Type: application/json' -d '{
+    "backfill_code":"BF-LINEA-20261001",
+    "records":[
+      {"external_ref":"DEV-A-001","type":"PROCESS","event_time":"2026-10-01T08:00",
+       "equipment_code":"LINE-A","batch_code":"BATCH-OFF-001",
+       "material_inputs":[{"material_code":"MILK-01"}]},
+      {"external_ref":"DEV-A-002","type":"CLEAN","event_time":"2026-10-01T09:00",
+       "equipment_code":"LINE-A","note":"换线全清"},
+      {"external_ref":"DEV-A-003","type":"PROCESS","event_time":"2026-10-01T10:00",
+       "equipment_code":"LINE-A","batch_code":"BATCH-OFF-002",
+       "material_inputs":[{"material_code":"EGG-01"}],
+       "ref_batch_codes":["BATCH-OFF-001"]}
+    ]
+  }'
+# -> { ok:true, idempotent:false, event_mapping:{"DEV-A-001":10,"DEV-A-002":11,"DEV-A-003":12},
+#      impact_summary:{ inserted_events:3, reused_events:0, invalidated_releases:0, ... },
+#      invalidated:[], retired_rolls:[], pending_shipments:[], stale_dispositions:[] }
+
+# 2) 网络重试：相同补录批号 + 相同内容（即使设备/原料改用 id 形式）-> 原结果，不重复写入
+curl -s -X POST http://localhost:3000/api/backfills -H 'Content-Type: application/json' -d '{
+  "backfill_code":"BF-LINEA-20261001",
+  "records":[
+    {"external_ref":"DEV-A-001","type":"PROCESS","event_time":"2026-10-01T08:00",
+     "equipment_id":1,"batch_code":"BATCH-OFF-001","material_inputs":[{"material_id":3}]},
+    {"external_ref":"DEV-A-002","type":"CLEAN","event_time":"2026-10-01T09:00","equipment_id":1},
+    {"external_ref":"DEV-A-003","type":"PROCESS","event_time":"2026-10-01T10:00",
+     "equipment_id":1,"batch_code":"BATCH-OFF-002",
+     "material_inputs":[{"material_id":4}],"ref_batch_codes":["BATCH-OFF-001"]}
+  ]
+}'
+# -> { ok:true, idempotent:true, event_mapping:{...同上，事件号不变...}, impact_summary:{...首次结果...} }
+
+# 3) 非法整包（时间冲突 / 引用包内更晚产出 / 空清洗集合 / 未知对象）-> 400，整包回滚不留事件
+curl -s -X POST http://localhost:3000/api/backfills -H 'Content-Type: application/json' -d '{
+  "backfill_code":"BF-BAD",
+  "records":[
+    {"external_ref":"B1","type":"PROCESS","event_time":"2026-10-01T13:00","equipment_id":1,
+     "batch_code":"BATCH-BAD-1","material_inputs":[],
+     "ref_batch_codes":["BATCH-BAD-2"]},
+    {"external_ref":"B2","type":"PROCESS","event_time":"2026-10-01T14:00","equipment_id":1,
+     "batch_code":"BATCH-BAD-2","material_inputs":[]}
+  ]
+}'
+# -> { error:"补录包引用的档案不存在或包内引用不合法", code:"BACKFILL_REJECTED",
+#      details:["records[0]（外部记录号 B1）：包内引用只可指向有序记录中更早产出的批次 …"] }
+
+# 4) 按补录批号对账：事件后经单条接口更正/删除会逐条标 MISMATCH/DELETED
+curl -s http://localhost:3000/api/backfills/BF-LINEA-20261001
+# -> { backfill_code, status:"OK" | "HAS_DRIFT",
+#      reconcile_summary:{ ok:3, mismatch:0, deleted:0 },
+#      records:[{ seq:0, external_ref:"DEV-A-001", event_id:10, type:"PROCESS",
+#                 reconcile_status:"OK", reconcile_detail:"事件仍在，内容与补录一致", ... }],
+#      result:{ ...首次提交返回的完整结果... } }
+
+# 5) 补录批号列表
+curl -s http://localhost:3000/api/backfills
+# -> { backfills:[{ backfill_id, backfill_code, record_count, inserted_count,
+#                   reused_count, deleted_events, created_at }] }
+```
+
+| 场景 | HTTP | `code` |
+| --- | --- | --- |
+| 请求体形状错（缺补录批号/空记录/缺外部记录号/包内外部记录号重复/时间格式错）、显式空清洗集合/非字符串空白名称、PROCESS 携带清洗范围 | 400 | `INVALID_REQUEST` |
+| 未知设备/原料/供应批号/引用批次、批号与原料不匹配、包内引用指向更晚产出、产出批次已在库 | 400 | `BACKFILL_REJECTED` |
+| 整包应用后时间线非法（时间冲突/未来或同时刻引用/引用环/批次重复产出） | 400 | `BACKFILL_REJECTED`（整包回滚，不留部分事件） |
+| 相同补录批号内容不同 | 409 | `BACKFILL_CODE_CONFLICT` |
+| 外部记录号与已入库内容冲突（同号不同内容；或同号的既有事件已删除无法复用） | 409 | `BACKFILL_EXTERNAL_REF_CONFLICT` |
+| 按补录批号对账不存在 | 404 | `BACKFILL_NOT_FOUND` |
+
+
 ## 一键启动（Docker，从空环境开始）
 
 要求安装 Docker 与 Docker Compose（v2）。在项目目录执行：
@@ -749,6 +928,7 @@ npm run test:shipments # 端到端验证包装出货：余额、整单事务拒�
 npm run test:evaluations # 端到端验证待评估单质量处置：评估视图/版本并发/CONTINUE 条件/只增不改/需重新评估
 npm run test:trace       # 端到端验证供应批号登记/投料批号/追溯传播（直接/引用/残留/清洗截断/未知无法排除）/更正删除更新/换线带批号/只读不改动
 npm run test:partial-clean # 端到端验证部分清洗：入参校验/只清指定过敏原/重算联动（放行/卷/出货/处置）/追溯按过敏原保留设备传播/全清与无过敏原原料/换线预演确认
+npm run test:backfill     # 端到端验证断网日志整包补录：整包事务/包内引用/幂等重试/外部记录号复用与冲突/重算联动（放行/卷/出货/处置）/对账（OK/MISMATCH/DELETED）/旧接口兼容
 ```
 
 ## 访问地址与端口
@@ -819,9 +999,10 @@ server/
   evaluation.js  # 待评估单质量处置：评估视图、签名状态版本、整单结论事务提交、旧结论需重评核对
   lots.js        # 原料供应批号：档案登记/标记/删除、投料批号解析（不存在/不匹配明确拒绝）
   trace.js       # 批号流向追溯：逐时回放（直接投料/前序引用/设备残留；全清截断、部分清洗按来源过敏原逐次截断）、确定命中与批号未知无法排除、关联出货单
+  backfill.js    # 断网日志整包补录：有序记录（外部记录号/时间/设备，加工含产出批次/原料批号可未知/引用批次，清洗省略范围=全清非空=部分）；整包事务校验+重算；同批号同内容幂等、同号复用/冲突拒绝；补录批号对账（OK/MISMATCH/DELETED）
   replan.js      # 整组换线：影子库预演、业务版本签名令牌、事务确认应用（update/insert_clean 支持 clean_allergens 清洗范围；update 支持 material_inputs 带批号）
   seed.js        # 首次启动演示数据（含供应批号、同原料多批号投料、一卷演示标签卷与一张演示出货单）
-  server.js      # Express API 与静态页面（含 /api/material-lots、/api/trace/material-lot、/api/label-rolls、/api/shipments、/api/replan/preview|apply、/api/shipments/:id/evaluation|dispositions）
+  server.js      # Express API 与静态页面（含 /api/material-lots、/api/trace/material-lot、/api/label-rolls、/api/shipments、/api/replan/preview|apply、/api/shipments/:id/evaluation|dispositions、/api/backfills 补录与对账）
 public/
   index.html  styles.css  app.js
 scripts/
@@ -832,5 +1013,6 @@ scripts/
   test-evaluations.js # 出货质量处置：评估视图/版本并发/CONTINUE 条件/只增不改/需重新评估端到端测试
   test-trace.js       # 供应批号与流向追溯：档案/投料批号/三路径传播/清洗截断/未知无法排除/更正删除/换线带批号/只读 端到端测试
   test-partial-clean.js # 部分清洗：入参校验/部分清除推导/重算联动/追溯过敏原级截断/换线预演确认 端到端测试
+  test-backfill.js   # 断网日志整包补录：整包事务/包内引用/幂等/外部记录号复用与冲突/重算联动/对账/旧接口兼容 端到端测试
 Dockerfile  docker-compose.yml
 ```

@@ -206,6 +206,42 @@ function initSchema(d) {
     version INTEGER NOT NULL DEFAULT 0
   );
 
+  -- 断网补录批号（整包）：一次断网期间的加工/已核实清洗日志用一个补录批号整包提交。
+  -- 整包事务化：任一记录不合法（未知对象、空清洗集合、时间冲突、未来/循环引用、
+  -- 外部记录号冲突等）整包回滚，不留部分事件。
+  -- 补录批号唯一：同号同内容重试返回原结果（幂等）；同号不同内容整包拒绝。
+  CREATE TABLE IF NOT EXISTS backfill_batches (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    backfill_code TEXT NOT NULL UNIQUE,      -- 补录批号（调用方提供，全局唯一）
+    content_hash TEXT NOT NULL,              -- 整包内容哈希（解析为 id 后的规范化内容，供同号重试比对）
+    external_hash TEXT NOT NULL DEFAULT '',  -- 整包外部形态哈希（id/code 解析前，供重试提前判定，绕过解析）
+    record_count INTEGER NOT NULL,           -- 包内有序记录数
+    inserted_count INTEGER NOT NULL DEFAULT 0, -- 本次新写入的事件数（同号同内容的既有记录不重复写入）
+    reused_count INTEGER NOT NULL DEFAULT 0,   -- 命中既有外部记录号、复用既有事件的记录数
+    result_json TEXT NOT NULL DEFAULT '{}',  -- 首次成功的完整响应（重试原样返回）
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+  );
+
+  -- 补录包内记录（每条含外部记录号、时间与设备；与实际事件一一对应）。
+  -- 外部记录号语义：同号同内容允许跨包复用（指向同一既有事件，不重复写入，见 idx_backfill_records_external），
+  -- 同号不同内容在提交校验阶段即整包拒绝。
+  -- event_id 不加外键：事件随后可经既有单条接口更正/删除（兼容性不变），
+  -- 对账时如实反映“事件仍在 / 已被更正 / 已删除”。
+  CREATE TABLE IF NOT EXISTS backfill_records (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    backfill_id INTEGER NOT NULL REFERENCES backfill_batches(id),
+    seq INTEGER NOT NULL,                    -- 包内顺序（0 起；包内引用只可指向更早产出）
+    external_ref TEXT NOT NULL,              -- 外部记录号（断网日志中的原始记录号）
+    event_type TEXT NOT NULL CHECK (event_type IN ('PROCESS','CLEAN')),
+    event_time TEXT NOT NULL,
+    equipment_id INTEGER NOT NULL,
+    event_id INTEGER,                        -- 对应事件 id（复用既有记录时指向既有事件；事件删除后置空）
+    content_hash TEXT NOT NULL,              -- 本记录内容哈希（解析后规范化，供外部记录号冲突检测）
+    canonical_json TEXT NOT NULL DEFAULT '{}', -- 解析后规范化记录（对账比对基线）
+    UNIQUE (backfill_id, seq),
+    UNIQUE (backfill_id, external_ref)
+  );
+
   CREATE INDEX IF NOT EXISTS idx_events_time ON events(event_time, id);
   CREATE INDEX IF NOT EXISTS idx_process_inputs_event ON process_inputs(event_id);
   CREATE INDEX IF NOT EXISTS idx_material_lots_material ON material_lots(material_id);
@@ -217,6 +253,11 @@ function initSchema(d) {
   CREATE INDEX IF NOT EXISTS idx_shipment_items_shipment ON shipment_items(shipment_id);
   CREATE INDEX IF NOT EXISTS idx_shipment_items_roll ON shipment_items(roll_id);
   CREATE INDEX IF NOT EXISTS idx_ship_disp_shipment ON shipment_dispositions(shipment_id);
+  CREATE INDEX IF NOT EXISTS idx_backfill_records_backfill ON backfill_records(backfill_id);
+  CREATE INDEX IF NOT EXISTS idx_backfill_records_event ON backfill_records(event_id);
+  -- 外部记录号查询索引：同号同内容允许跨包复用（指向同一既有事件，不重复写入），
+  -- 故不加全局唯一约束；“同号不同内容整包拒绝”在提交校验中按首次出现记录比对哈希强制。
+  CREATE INDEX IF NOT EXISTS idx_backfill_records_external ON backfill_records(external_ref);
   `);
 
   // ---- 旧库迁移（CREATE TABLE IF NOT EXISTS 不会为既有表补列）----
